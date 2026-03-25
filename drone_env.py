@@ -1,10 +1,14 @@
 """
-drone_env.py — Realistic 3D Drone Navigation Environment
-=========================================================
+drone_env.py — Phase 2: Mid-Level Dynamic Drone Navigation Environment
+=======================================================================
 World   : 50 m × 50 m × 20 m continuous space
-Action  : continuous [vx, vy, vz] ∈ [-1, 1]  →  scaled to MAX_SPEED m/step
-Obs (20): goal_dir(3) | goal_dist(1) | pos(3) | vel(3) | lidar×10
-Obstacles: buildings (AABB), trees (cylinder), rocks (sphere)  — mixed every episode
+Action  : continuous [thrust, roll_cmd, pitch_cmd, yaw_rate_cmd] ∈ [-1, 1]
+Obs (26): goal_dir(3) | goal_dist(1) | pos(3) | vel(3) | rpy(3) | ang_vel(3) | lidar×10
+Obstacles: buildings (AABB), trees (cylinder), rocks (sphere) — mixed every episode
+
+Physics : Gravity enabled, PD attitude controller converts desired angles/thrust
+          into forces and torques.  The AI acts as the pilot; a hard-coded PD
+          controller inside step() acts as the flight controller.
 """
 
 import gymnasium as gym
@@ -17,11 +21,26 @@ class DroneEnv(gym.Env):
 
     # ── World constants ──────────────────────────────────────────────
     WORLD      = np.array([50.0, 50.0, 20.0], dtype=np.float64)
-    MAX_SPEED  = 1.5          # metres per step
     LIDAR_MAX  = 12.0         # metres
     DRONE_R    = 0.40         # collision radius (metres)
     GOAL_R     = 1.50         # goal-reached radius (metres)
     MIN_HEIGHT = 0.30         # ground clearance
+
+    # ── Physics constants ────────────────────────────────────────────
+    MASS        = 1.0          # kg
+    GRAVITY     = 9.81         # m/s²
+    DT          = 0.05         # simulation timestep (seconds)
+
+    MAX_THRUST  = 2.0 * 9.81   # maximum thrust (2g), mapped from action [0, 2g]
+    MAX_ANGLE   = np.radians(30.0)   # ≈ 0.5236 rad — max desired roll/pitch
+    MAX_YAW_RATE = np.radians(90.0)  # ≈ 1.5708 rad/s — max yaw rate command
+    MAX_ANG_VEL = 3.0          # rad/s clamp for angular velocities
+    MAX_VEL     = 5.0          # m/s  clamp for linear velocity
+
+    # ── PD attitude controller gains ─────────────────────────────────
+    KP_RP      = 15.0          # roll / pitch proportional gain
+    KD_RP      =  5.0          # roll / pitch derivative gain
+    KP_YAW     =  5.0          # yaw rate proportional gain
 
     # 10 lidar directions: 6 cardinal + 4 horizontal diagonals
     _RAW_DIRS = np.array([
@@ -39,23 +58,30 @@ class DroneEnv(gym.Env):
         norms = np.linalg.norm(self._RAW_DIRS, axis=1, keepdims=True)
         self.LIDAR_DIRS = (self._RAW_DIRS / norms).astype(np.float64)
 
-        # All observations normalised into roughly [-1, 1]
+        # Observation: 26 dimensions  (was 20 in Phase 1)
+        #   goal_dir(3) + goal_dist(1) + pos(3) + vel(3)
+        #   + rpy(3) + ang_vel(3) + lidar(10)
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(20,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(26,), dtype=np.float32
         )
 
-        # Continuous 3-axis velocity command
+        # Action: [thrust, roll_cmd, pitch_cmd, yaw_rate_cmd]  (was 3D velocity)
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(3,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(4,), dtype=np.float32
         )
 
-        self.max_steps  = 600
-        self.obstacles  = []
-        self.drone_pos  = np.zeros(3, dtype=np.float32)
-        self.drone_vel  = np.zeros(3, dtype=np.float32)
-        self.goal       = np.zeros(3, dtype=np.float32)
-        self._prev_dist = 0.0
-        self.steps      = 0
+        self.max_steps      = 600
+        self.obstacles      = []
+
+        # State variables
+        self.drone_pos      = np.zeros(3, dtype=np.float64)
+        self.drone_vel      = np.zeros(3, dtype=np.float64)
+        self.drone_rpy      = np.zeros(3, dtype=np.float64)   # [roll, pitch, yaw]
+        self.drone_ang_vel  = np.zeros(3, dtype=np.float64)   # [p, q, r] rad/s
+
+        self.goal           = np.zeros(3, dtype=np.float64)
+        self._prev_dist     = 0.0
+        self.steps          = 0
 
     # ════════════════════════════════════════════════════════════════
     #  RESET
@@ -64,21 +90,23 @@ class DroneEnv(gym.Env):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
 
-        # Drone starts in the low-x / low-y corner of the world
+        # Drone starts in the low-x / low-y corner
         self.drone_pos = np.array([
             rng.uniform(2.0, 12.0),
             rng.uniform(2.0, 12.0),
             rng.uniform(2.0,  8.0),
-        ], dtype=np.float32)
+        ], dtype=np.float64)
 
-        self.drone_vel = np.zeros(3, dtype=np.float32)
+        self.drone_vel     = np.zeros(3, dtype=np.float64)
+        self.drone_rpy     = np.zeros(3, dtype=np.float64)
+        self.drone_ang_vel = np.zeros(3, dtype=np.float64)
 
-        # Goal is placed in the opposite (high-x / high-y) corner
+        # Goal in the opposite corner
         self.goal = np.array([
             rng.uniform(38.0, 48.0),
             rng.uniform(38.0, 48.0),
             rng.uniform( 2.0, 12.0),
-        ], dtype=np.float32)
+        ], dtype=np.float64)
 
         self._generate_obstacles(rng)
         self._clear_near(self.drone_pos, clear_r=4.0)
@@ -103,8 +131,8 @@ class DroneEnv(gym.Env):
             y = float(rng.uniform(10.0, 40.0))
             self.obstacles.append({
                 "type": "box",
-                "pos":  np.array([x, y, h / 2], dtype=np.float32),
-                "he":   np.array([w / 2, w / 2, h / 2], dtype=np.float32),
+                "pos":  np.array([x, y, h / 2], dtype=np.float64),
+                "he":   np.array([w / 2, w / 2, h / 2], dtype=np.float64),
                 # ── Visualiser hints ────────────────────────────────
                 "vis_w": w, "vis_h": h,
             })
@@ -117,7 +145,7 @@ class DroneEnv(gym.Env):
             y = float(rng.uniform(3.0, 47.0))
             self.obstacles.append({
                 "type":   "cylinder",
-                "pos":    np.array([x, y, h / 2], dtype=np.float32),
+                "pos":    np.array([x, y, h / 2], dtype=np.float64),
                 "radius": r,
                 "height": h,
             })
@@ -129,7 +157,7 @@ class DroneEnv(gym.Env):
             y = float(rng.uniform(3.0, 47.0))
             self.obstacles.append({
                 "type":   "sphere",
-                "pos":    np.array([x, y, r], dtype=np.float32),   # sits on ground
+                "pos":    np.array([x, y, r], dtype=np.float64),
                 "radius": r,
             })
 
@@ -262,49 +290,135 @@ class DroneEnv(gym.Env):
         return result
 
     # ════════════════════════════════════════════════════════════════
+    #  ROTATION HELPERS
+    # ════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _rotation_matrix(roll, pitch, yaw):
+        """Build a ZYX rotation matrix from Euler angles (radians)."""
+        cr, sr = np.cos(roll),  np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw),   np.sin(yaw)
+
+        R = np.array([
+            [cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
+            [sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
+            [  -sp,           cp*sr,           cp*cr     ],
+        ], dtype=np.float64)
+        return R
+
+    # ════════════════════════════════════════════════════════════════
     #  OBSERVATION  (all values ∈ [-1, 1] or [0, 1])
     # ════════════════════════════════════════════════════════════════
     def _obs(self) -> np.ndarray:
         dv       = (self.goal - self.drone_pos).astype(np.float64)
         dist     = float(np.linalg.norm(dv))
-        goal_dir = (dv / (dist + 1e-8)).astype(np.float32)          # unit vec
-        goal_dist_n = np.float32(np.clip(dist / 70.0, 0.0, 1.0))   # ~max diagonal
+        goal_dir = (dv / (dist + 1e-8)).astype(np.float32)           # unit vec
+        goal_dist_n = np.float32(np.clip(dist / 70.0, 0.0, 1.0))    # ~max diagonal
 
-        pos_n = (self.drone_pos / self.WORLD).astype(np.float32)                   # [0,1]
-        vel_n = np.clip(self.drone_vel / self.MAX_SPEED, -1.0, 1.0).astype(np.float32)
+        pos_n = (self.drone_pos / self.WORLD).astype(np.float32)     # [0, 1]
+        vel_n = np.clip(
+            self.drone_vel / self.MAX_VEL, -1.0, 1.0
+        ).astype(np.float32)
+
+        # ── NEW: orientation + angular velocity ──────────────────────
+        rpy_n = np.clip(
+            self.drone_rpy / np.pi, -1.0, 1.0
+        ).astype(np.float32)
+        ang_vel_n = np.clip(
+            self.drone_ang_vel / self.MAX_ANG_VEL, -1.0, 1.0
+        ).astype(np.float32)
 
         lidar = self._lidar()
 
-        return np.concatenate([goal_dir, [goal_dist_n], pos_n, vel_n, lidar])
+        return np.concatenate([
+            goal_dir, [goal_dist_n],
+            pos_n, vel_n,
+            rpy_n, ang_vel_n,        # ← 6 new dimensions
+            lidar,
+        ])
 
     # ════════════════════════════════════════════════════════════════
-    #  STEP
+    #  STEP  —  PD Attitude Controller + Force Integration
     # ════════════════════════════════════════════════════════════════
     def step(self, action):
-        action          = np.clip(action, -1.0, 1.0).astype(np.float32)
-        self.drone_vel  = action * self.MAX_SPEED
-        self.drone_pos  = self.drone_pos + self.drone_vel
+        action = np.clip(action, -1.0, 1.0).astype(np.float64)
 
-        # ── Soft boundary: clip and zero the offending velocity axis ─
+        # ── 1. Decode action ─────────────────────────────────────────
+        #  thrust_cmd ∈ [-1, 1] → thrust ∈ [0, 2g]  (0 = hover at action=0)
+        thrust_mag    = (action[0] + 1.0) * 0.5 * self.MAX_THRUST
+        desired_roll  = action[1] * self.MAX_ANGLE
+        desired_pitch = action[2] * self.MAX_ANGLE
+        desired_yaw_r = action[3] * self.MAX_YAW_RATE
+
+        roll, pitch, yaw = self.drone_rpy
+        p_rate, q_rate, r_rate = self.drone_ang_vel
+
+        # ── 2. PD attitude controller → angular acceleration ─────────
+        roll_torque  = self.KP_RP  * (desired_roll  - roll)  - self.KD_RP * p_rate
+        pitch_torque = self.KP_RP  * (desired_pitch - pitch) - self.KD_RP * q_rate
+        yaw_torque   = self.KP_YAW * (desired_yaw_r - r_rate)
+
+        # Angular acceleration (simplified: τ / I, assume I = 1 for unit mass drone)
+        ang_acc = np.array([roll_torque, pitch_torque, yaw_torque], dtype=np.float64)
+
+        # ── 3. Integrate angular velocity & orientation ──────────────
+        self.drone_ang_vel = self.drone_ang_vel + ang_acc * self.DT
+        self.drone_ang_vel = np.clip(
+            self.drone_ang_vel, -self.MAX_ANG_VEL, self.MAX_ANG_VEL
+        )
+
+        self.drone_rpy = self.drone_rpy + self.drone_ang_vel * self.DT
+        # Wrap yaw to [-π, π]
+        self.drone_rpy[2] = (self.drone_rpy[2] + np.pi) % (2 * np.pi) - np.pi
+
+        # ── 4. Compute thrust in world frame ─────────────────────────
+        R = self._rotation_matrix(*self.drone_rpy)
+        # Thrust acts along the body's local Z-axis (up)
+        thrust_world = R @ np.array([0.0, 0.0, thrust_mag], dtype=np.float64)
+
+        # Gravity pulls down
+        gravity = np.array([0.0, 0.0, -self.GRAVITY * self.MASS], dtype=np.float64)
+
+        # Net acceleration (F = ma, m = 1)
+        net_acc = (thrust_world + gravity) / self.MASS
+
+        # ── 5. Integrate linear velocity & position ──────────────────
+        self.drone_vel = self.drone_vel + net_acc * self.DT
+        self.drone_vel = np.clip(self.drone_vel, -self.MAX_VEL, self.MAX_VEL)
+        self.drone_pos = self.drone_pos + self.drone_vel * self.DT
+
+        # ── 6. Soft boundary: clip position, zero velocity on contact ─
         boundary_hit = False
-        lo = np.array([0.0, 0.0, self.MIN_HEIGHT], dtype=np.float32)
-        hi = self.WORLD.astype(np.float32)
+        lo = np.array([0.0, 0.0, self.MIN_HEIGHT], dtype=np.float64)
+        hi = self.WORLD.astype(np.float64)
         clipped = np.clip(self.drone_pos, lo, hi)
         if not np.array_equal(clipped, self.drone_pos):
-            boundary_hit     = True
-            self.drone_pos   = clipped
-            self.drone_vel   = np.zeros(3, dtype=np.float32)
+            boundary_hit = True
+            # Zero the velocity component for each axis that was clipped
+            for ax in range(3):
+                if clipped[ax] != self.drone_pos[ax]:
+                    self.drone_vel[ax] = 0.0
+            self.drone_pos = clipped
 
         self.steps += 1
 
-        # ── Collision check ──────────────────────────────────────────
+        # ── 7. Extreme tilt check (instant crash > 60°) ─────────────
+        roll, pitch, _ = self.drone_rpy
+        extreme_tilt = abs(roll) > np.radians(60.0) or abs(pitch) > np.radians(60.0)
+        if extreme_tilt:
+            return self._obs(), -100.0, True, False, {"reason": "flip"}
+
+        # ── 8. Collision check ───────────────────────────────────────
         if self._collides():
             return self._obs(), -100.0, True, False, {"reason": "collision"}
 
-        # ── Reward ───────────────────────────────────────────────────
+        # ── 9. Reward ────────────────────────────────────────────────
         new_dist = float(np.linalg.norm(self.goal - self.drone_pos))
-        reward   = (self._prev_dist - new_dist) * 3.0   # scaled distance progress
-        reward  -= 0.05                                   # per-step time penalty
+
+        # Base navigation reward
+        reward  = (self._prev_dist - new_dist) * 3.0    # progress toward goal
+        reward -= 0.05                                    # time penalty
+
         if boundary_hit:
             reward -= 5.0
 
@@ -316,12 +430,25 @@ class DroneEnv(gym.Env):
             if min_obs < 2.5:
                 reward -= (2.5 - min_obs) * 0.5
 
+        # ── NEW: stability penalties ─────────────────────────────────
+        abs_roll  = abs(roll)
+        abs_pitch = abs(pitch)
+
+        # Tilt penalty — proportional to angle deviation
+        tilt_penalty = 2.0 * (abs_roll / self.MAX_ANGLE + abs_pitch / self.MAX_ANGLE)
+        reward -= tilt_penalty
+
+        # Spin penalty — penalise excessive angular velocity
+        ang_vel_mag = float(np.linalg.norm(self.drone_ang_vel))
+        spin_penalty = 0.5 * ang_vel_mag / self.MAX_ANG_VEL
+        reward -= spin_penalty
+
         self._prev_dist = new_dist
 
-        # ── Goal reached ─────────────────────────────────────────────
+        # ── 10. Goal reached ─────────────────────────────────────────
         if new_dist < self.GOAL_R:
             return self._obs(), 200.0, True, False, {"reason": "goal"}
 
         done = self.steps >= self.max_steps
-        return self._obs(), reward, done, False,\
+        return self._obs(), reward, done, False, \
                {"reason": "timeout" if done else "running"}

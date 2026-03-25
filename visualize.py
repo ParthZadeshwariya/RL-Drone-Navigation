@@ -10,7 +10,7 @@ Features
   • HUD              : episode counter, distance to goal, status overlay
   • Clean exit       : Ctrl-C or closing the window terminates gracefully
 """
-
+print("Script started")
 import sys
 import time
 import warnings
@@ -385,19 +385,27 @@ def hud_update(episode: int, drone_pos: np.ndarray, goal_pos: np.ndarray,
 
     dist = float(np.linalg.norm(goal_pos - drone_pos))
 
+    # Extract drone position for relative text placement
+    x, y, z = drone_pos[0], drone_pos[1], drone_pos[2]
+
+    # Fixed spatial offset pushing HUD towards the top-left of camera view
+    # This acts like a fixed "mid-point" relative to the camera frame.
+    ox, oy, oz = x - 5.0, y + 5.0, z + 12.0
+
     _hud_ids.append(p.addUserDebugText(
-        f"Episode : {episode}",
-        [1, 1, 19.5], textSize=1.6, textColorRGB=[1.0, 1.0, 1.0]
+        f"[ EPISODE : {episode:03d} ]",
+        [ox, oy, oz], textSize=2.0, textColorRGB=[0.2, 0.9, 1.0]
     ))
     _hud_ids.append(p.addUserDebugText(
-        f"Goal dist: {dist:5.1f} m",
-        [1, 1, 18.0], textSize=1.4, textColorRGB=[0.9, 0.9, 0.1]
+        f"DISTANCE  : {dist:5.1f}m",
+        [ox, oy, oz - 2.0], textSize=2.0, textColorRGB=[1.0, 0.8, 0.1]
     ))
     if status:
+        stat_col = [0.2, 1.0, 0.2] if "GOAL" in status else [1.0, 0.2, 0.2]
         _hud_ids.append(p.addUserDebugText(
-            status,
-            [25, 25, 16], textSize=3.0, textColorRGB=[0.1, 1.0, 0.3],
-            lifeTime=2.0
+            f"» {status} «",
+            [ox, oy, oz - 5.0], textSize=3.5, textColorRGB=stat_col,
+            lifeTime=2.5
         ))
 
 
@@ -452,7 +460,7 @@ goal_pos  = raw_env.goal.copy()
 
 # Setup smooth visual trackers
 vis_pos = drone_pos.copy()
-vis_orn = drone_orn.copy()
+vis_orn = list(drone_orn)
 done      = False
 
 try:
@@ -608,3 +616,4 @@ finally:
     except Exception:
         pass
     sys.exit(0)
+print("Script finished")
