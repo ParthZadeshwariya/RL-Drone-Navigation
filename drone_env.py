@@ -82,6 +82,7 @@ class DroneEnv(gym.Env):
         self.goal           = np.zeros(3, dtype=np.float64)
         self._prev_dist     = 0.0
         self.steps          = 0
+        self.last_thrust    = 0.0
 
     # ════════════════════════════════════════════════════════════════
     #  RESET
@@ -114,6 +115,7 @@ class DroneEnv(gym.Env):
 
         self.steps      = 0
         self._prev_dist = float(np.linalg.norm(self.goal - self.drone_pos))
+        self.last_thrust = 0.0
 
         return self._obs(), {}
 
@@ -346,6 +348,7 @@ class DroneEnv(gym.Env):
         # ── 1. Decode action ─────────────────────────────────────────
         #  thrust_cmd ∈ [-1, 1] → thrust ∈ [0, 2g]  (0 = hover at action=0)
         thrust_mag    = (action[0] + 1.0) * 0.5 * self.MAX_THRUST
+        self.last_thrust = thrust_mag
         desired_roll  = action[1] * self.MAX_ANGLE
         desired_pitch = action[2] * self.MAX_ANGLE
         desired_yaw_r = action[3] * self.MAX_YAW_RATE

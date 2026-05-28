@@ -76,7 +76,7 @@ viz_env = VecNormalize.load("vec_normalize.pkl", viz_env)
 viz_env.training    = False
 viz_env.norm_reward = False
 
-model   = PPO.load("drone_model", env=viz_env)
+model   = PPO.load("drone_model.zip", env=viz_env)
 raw_env = viz_env.envs[0]          # direct access to DroneEnv instance
 obs     = viz_env.reset()
 
@@ -378,7 +378,7 @@ _hud_ids: list[int] = []
 
 
 def hud_update(episode: int, drone_pos: np.ndarray, goal_pos: np.ndarray,
-               status: str = ""):
+               status: str = "", env=None):
     for tid in _hud_ids:
         p.removeUserDebugItem(tid)
     _hud_ids.clear()
@@ -398,13 +398,42 @@ def hud_update(episode: int, drone_pos: np.ndarray, goal_pos: np.ndarray,
     ))
     _hud_ids.append(p.addUserDebugText(
         f"DISTANCE  : {dist:5.1f}m",
-        [ox, oy, oz - 2.0], textSize=2.0, textColorRGB=[1.0, 0.8, 0.1]
+        [ox, oy, oz - 1.5], textSize=1.5, textColorRGB=[1.0, 0.8, 0.1]
     ))
+
+    offset_z = oz - 3.0
+    if env is not None:
+        vel = float(np.linalg.norm(env.drone_vel))
+        alt = float(env.drone_pos[2])
+        roll, pitch, yaw = np.degrees(env.drone_rpy)
+        thrust = float(getattr(env, 'last_thrust', 0.0))
+        
+        _hud_ids.append(p.addUserDebugText(
+            f"ALTITUDE : {alt:5.1f}m",
+            [ox, oy, offset_z], textSize=1.2, textColorRGB=[0.8, 0.8, 0.8]
+        ))
+        offset_z -= 1.2
+        _hud_ids.append(p.addUserDebugText(
+            f"VELOCITY : {vel:5.1f}m/s",
+            [ox, oy, offset_z], textSize=1.2, textColorRGB=[0.8, 0.8, 0.8]
+        ))
+        offset_z -= 1.2
+        _hud_ids.append(p.addUserDebugText(
+            f"THRUST   : {thrust:5.1f}N",
+            [ox, oy, offset_z], textSize=1.2, textColorRGB=[0.8, 0.8, 0.8]
+        ))
+        offset_z -= 1.2
+        _hud_ids.append(p.addUserDebugText(
+            f"R/P/Y    : {roll:4.0f} {pitch:4.0f} {yaw:4.0f}",
+            [ox, oy, offset_z], textSize=1.2, textColorRGB=[0.8, 0.8, 0.8]
+        ))
+        offset_z -= 1.5
+
     if status:
         stat_col = [0.2, 1.0, 0.2] if "GOAL" in status else [1.0, 0.2, 0.2]
         _hud_ids.append(p.addUserDebugText(
             f"» {status} «",
-            [ox, oy, oz - 5.0], textSize=3.5, textColorRGB=stat_col,
+            [ox, oy, offset_z], textSize=2.5, textColorRGB=stat_col,
             lifeTime=2.5
         ))
 
@@ -522,7 +551,7 @@ try:
             trail_add(vis_pos)
 
         if _render_tick % HUD_INTERVAL == 0:
-            hud_update(episode_count, vis_pos, goal_pos)
+            hud_update(episode_count, vis_pos, goal_pos, env=raw_env)
 
         if _render_tick % CAM_INTERVAL == 0:
             cam_follow(vis_pos)
@@ -549,7 +578,7 @@ try:
             if reason == "goal":
                 print(f"[Ep {episode_count:>4}] ✓ GOAL REACHED  "
                       f"(steps: {step_tick})")
-                hud_update(episode_count, vis_pos, goal_pos, "GOAL REACHED!")
+                hud_update(episode_count, vis_pos, goal_pos, "GOAL REACHED!", env=raw_env)
 
                 # Drone flashes green three times
                 for _ in range(3):
@@ -569,7 +598,7 @@ try:
                 label = "COLLISION" if reason == "collision" else "TIMEOUT"
                 print(f"[Ep {episode_count:>4}] ✗ {label:<10}  "
                       f"(steps: {step_tick})")
-                hud_update(episode_count, vis_pos, goal_pos, label)
+                hud_update(episode_count, vis_pos, goal_pos, label, env=raw_env)
 
                 # Drone flashes red
                 for bid in ["body", "arm_0", "arm_1"]:
@@ -599,7 +628,7 @@ try:
             update_goal(goal_pos)
             build_scene()
             cam_follow(vis_pos)
-            hud_update(episode_count, vis_pos, goal_pos)
+            hud_update(episode_count, vis_pos, goal_pos, env=raw_env)
 
             # Brief pause at start so user can see the new position
             time.sleep(1.5)
